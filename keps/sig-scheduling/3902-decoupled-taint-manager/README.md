@@ -1,22 +1,20 @@
-# KEP-3902:  Decouple Taint-based Pod Eviction from Node LifeCycle Controller 
+# KEP-3902:  Decouple Taint-based Pod Eviction from Node Lifecycle Controller 
 <!-- toc -->
 - [Release Signoff Checklist](#release-signoff-checklist)
 - [Summary](#summary)
 - [Motivation](#motivation)
-  - [Why the use of  tolerations for <code>NoExecute</code> taints is not good enough for custom pod eviction?](#why-the-use-of--tolerations-for--taints-is-not-good-enough-for-custom-pod-eviction)
   - [Goals](#goals)
   - [Non-Goals](#non-goals)
 - [Proposal](#proposal)
   - [User Stories (Optional)](#user-stories-optional)
     - [Story 1](#story-1)
     - [Story 2](#story-2)
+    - [Story 3](#story-3)
     - [Story 4](#story-4)
   - [Notes/Constraints/Caveats (Optional)](#notesconstraintscaveats-optional)
   - [Risks and Mitigations](#risks-and-mitigations)
 - [Design Details](#design-details)
-  - [Current implementation](#current-implementation)
   - [Proposed Controllers](#proposed-controllers)
-  - [Custom taint-manager](#custom-taint-manager)
   - [Implementation](#implementation)
   - [Test Plan](#test-plan)
   - [Graduation Criteria](#graduation-criteria)
@@ -36,6 +34,7 @@
 - [Drawbacks](#drawbacks)
 - [Alternatives](#alternatives)
 - [Infrastructure Needed (Optional)](#infrastructure-needed-optional)
+- [Note](#note)
 <!-- /toc -->
 
 ## Release Signoff Checklist
@@ -59,41 +58,29 @@ Items marked with (R) are required *prior to targeting to a milestone / release*
 
 ## Summary
 
-In Kubernetes, `NodeLifeCycleController` applies predefined `NoExecute` taints (e.g., `Unreachable`, `NotReady`) when the nodes are determined to be unhealthy. After the nodes get tainted, the `taint-manager` does its due diligence to start deleting running pods on those nodes based on `NoExecute` taints, which can be added by anyone.
+In Kubernetes, `NodeLifecycleController` applies predefined `NoExecute` taints (e.g., `Unreachable`, `NotReady`) when the nodes are determined to be unhealthy. After the nodes get tainted, `TaintManager` does its due diligence to start deleting running pods on those nodes based on `NoExecute` taints, which can be added by anyone.
 
 In this KEP, we propose to 
 
-* Decouple `taint-manager` that performs taint-based pod eviction from `NodeLifeCycleController` and make them two separate controllers: `NodeLifeCycleManager` to add taints to unhealthy nodes and `TaintManager` to perform pod deletion on nodes tainted with NoExecute effect.
+* Decouple `TaintManager` that performs taint-based pod eviction from `NodeLifecycleController` and make them two separate controllers: `NodeLifecycleManager` to add taints to unhealthy nodes and `TaintManager` to perform pod deletion on nodes tainted with NoExecute effect.
 
-* Allow users to opt-out from the taint-based eviction while still retaining the overall functionality provided by `NodeLifeCycleController.`
+* Allow users to opt-out from the taint-based eviction while still retaining the overall functionality provided by `NodeLifecycleController.`
 
 ## Motivation
-
-* Whether or not evict a stateful pod with local storage on `NoExecute` can depend on the actual taint conditions, workload status and other conditions. The decision may require information from the external systems and controllers, which have more knowledge and context about the workloads.  A custom `taint-manager`  will be able to control how and when a pod is evicted or deleted, including making calls to external systems and take actions on  `NoExecute` taints with other conditions such as unhealthy network. 
-* Starting kubernetes 1.27, with the removal of the flag `enable-taint-manager`, replacing the default `NoExecute` taint-manager with a custom one would be more challenging. `NoExecute` taints can disable the no-execute taint manager, but such disabling can only be achieved through a mutating webhook on all pods, and it can interact negatively with the upstream `DefaultTolerations` webhook.
-* The requirement of custom taint-based eviction is not unique. It exists already in Kubernetes, where we call it `FullyDistributionMode`. When all nodes are unhealthy, `NodeLifeCycleController` chooses not to apply `NoExecute` taints properly. In a real-world case, the integrator may choose to define the disruption rate/budget, etc.
-* `NodeCycleController` combines two independent functions: adding a pre-defined set of `NoExecute` taints to unhealthy nodes and performing pod eviction on arbitrary `NoExecute` taints. While  `NodeLifecycle` controller responsibility is primarily on Node unhealthy-zone, `TaintManger` is concerned with actioning the taints added by `NodeLifecycle` controller by performing Pods eviction. De-coupling `NoExecuteTaintManager` from `NodeLifecycle` controller in `kube-controller-manager` would allow to implement a single eviction controller to take care of general Pod eviction and deletion for different cases based on workload needs, including `NoExecute` taint-based pod eviction other than node `Unhealthy` and `Unreachable`.   
-
-### Why the use of  tolerations for `NoExecute` taints is not good enough for custom pod eviction? 
-
-Toleration cannot provide a flexible and general enough extension mechanism to handle different Pod eviction and deletion cases to meet various workload requirements. 
-
-* The toleration mechanism is not flexible enough to handle complex stateful applications and workloads that require specific coordination of pod eviction, e.g. checkpointing for certain classes of machine-learning workloads to guarantee data integrity before deletion.
-* We operate clusters where we want to disable `NoExecute` eviction wholesale. Leveraging toleration would require adding it to every single pod in a cluster. Specifically, custom tolerations will require to either inject tolerations to all pods via mutating webhooks and/or changing the manifests of all the running workloads. 
-    * Custom mutating webhook may interfere with the the[admission plugin](https://github.com/kubernetes/kubernetes/blob/master/plugin/pkg/admission/defaulttolerationseconds/admission.go) that applies the default tolerations if they are trying to apply tolerations for similar taints. 
-    * Toleration update in Webhooks can cause conflicts with older version of pods especially during upgrades. 
-    * In order to ensure toleration updates are valid, a RBAC mechanism will be required in place. 
-* Toleration won’t allow users to leverage the existing tolerations API to interface with the component in charge of handling their termination.
-* It’s hard for toleration to interact with other controllers and workload management systems, which have more knowledge and context about workload disruption. It also limits to kubernetes clusters and cannot handle workloads that are split across Kubernetes/Non-Kubernetes platforms.
+* `NodeLifecycleController` combines two independent functions: adding a pre-defined set of `NoExecute` taints to unhealthy nodes and performing pod eviction on arbitrary `NoExecute` taints. While  `NodeLifecycleController`'s responsibility is primarily on Node unhealthy-zone, `TaintManager` is concerned with actioning the taints added by `NodeLifecycleController` by performing Pods eviction. De-coupling `NoExecuteTaintManager` from `NodeLifecycleController` in `kube-controller-manager` would allow to implement a single eviction controller to take care of general Pod eviction and deletion for different cases based on workload needs, including `NoExecute` taint-based pod eviction other than node `Unhealthy` and `Unreachable`.  Splitting `NodeLifecycleController` into two separate controllers will support more flexible extension and improvement of the existing node taint-based pod eviction. 
+* There are increasing needs to customize and extend the default node taint-based pod evictions in practice.
+  * Whether or not evict a stateful pod with local storage on `NoExecute` can depend on the actual taint conditions, workload status and other conditions. The decision may require information from the external systems and controllers, which have more knowledge and context about the workloads.  A custom `taint-manager`  will be able to control how and when a pod is evicted or deleted, including making calls to external systems and take actions on  `NoExecute` taints with other conditions such as unhealthy network. 
+  * Starting kubernetes 1.27, with the removal of the flag `enable-taint-manager`, replacing the default `NoExecute` taint-manager with a custom one would be more challenging. `NoExecute` taints can disable the no-execute taint manager, but such disabling can only be achieved through a mutating webhook on all pods, and it can interact negatively with the upstream `DefaultTolerations` webhook.
+  * The requirement of custom taint-based eviction is not unique. It exists already in Kubernetes, where we call it `FullyDistributionMode`. When all nodes are unhealthy, `NodeLifecycleController` chooses not to apply `NoExecute` taints properly. In a real-world case, the integrator may choose to define the disruption rate/budget, etc.
 
 ### Goals
 
-* Move taint-based eviction implementation out of `NodeLifeCycleController` into a separate and independent taint-manager.
-* Using the existing `kube-controller-manager ` `--controllers`  flag to enable and disable the default `taint-manager` to support customizable taint-manager controller. 
+* Move taint-based eviction implementation out of `NodeLifecycleController` into a separate and independent taint-manager to support flexible extension and customization of node taint-based eviction.
 
 ### Non-Goals
 
-* Any change to the behaviour of the current taint-manager
+* Improve and change the APIs to support extension and customization of the existing `TainaManager`.
+* Actual extension and improvement of the current `TaintManager`.
 
 ## Proposal
 
@@ -105,15 +92,15 @@ An operator of stateful workloads that use local persistent volume can disable t
 
 #### Story 2
 
-A cluster orchestrator can design and implement a centralized pod eviction manager that handles all pod eviction and deletions on different `NoExecute`  taints (`Unreachable`, `NotReady` and others) and any custom taints, e.g., acting on the condictions defined in `descheduler`, such as node overloading, etc.
+A cluster orchestrator can design and implement a centralized pod eviction manager that handles all pod eviction and deletions on different `NoExecute`  taints (`Unreachable`, `NotReady` and others) and any custom taints.
 
-**Story 3**
+#### Story 3
 
 A custom taint manager can make calls to other controllers or external systems to make a better decision whether, when and how to delete running pods on the tainted nodes (e.g. to prevent quorum loss and/or support different mechanism than Pod Disruption Budget to calculate applications availability).
 
 #### Story 4
 
-A pod may be stuck in terminating state for various reason, e.g.,  `kubelet` is not up and `AppServer` cannot reach `kubelet`, etc. The hanging deletion may prevent new pods starting because the persistent volume claim is not released. A custom taint-manager can perform a forceful deletion as needed.
+A pod may be stuck in terminating state for various reason, e.g.,  `kubelet` is not up and `APIServer` cannot reach `kubelet`, etc. The hanging deletion may prevent new pods starting because the persistent volume claim is not released. A custom taint-manager can perform a forceful deletion as needed.
 
 ### Notes/Constraints/Caveats (Optional)
 
@@ -121,9 +108,7 @@ A pod may be stuck in terminating state for various reason, e.g.,  `kubelet` is 
 
 ## Design Details
 
-### Current implementation
-
-In this current version, `NoExecuteTaintManager` is part of `NodeLifycleController`. It’s created and run if `enable-taint-manager` flag is true.  The flag is deprecated and will be removed in kubernetes 1.27. 
+In version 1.27 and prior of Kubernetes, `NoExecuteTaintManager` is part of `NodeLifecycleController`. It’s created and run if `enable-taint-manager` flag is true.  The flag is deprecated and will be removed in kubernetes 1.27. 
 
 <p align="center"><image src="current-nodelifecycle-controller.png" width=50%></p>
 
@@ -138,34 +123,20 @@ The existing  kube-controller-manager flag `--controllers` will be used to optio
 
 <p align="center"><image src="new-controllers.png" width=60%></p>
 
-### Custom taint-manager
-
-Opting out from the default `TaintManger`, Kubernetes operators will be able to implement custom logic to handle `NoExecute` taint such as delegating the authority for the termination for some classes of workloads providing high-availability protection guarantees. They can also scale out the usage of `NoExcute` to more use-cases than `NotReady` nodes (e.g. unhealthy network, etc.).
-
-<p align="center"><image src="custom-taint-manager.png" width=90%></p>
-
 ### Implementation
 
-A new `NodeLifeCycleManager` is implemented by removing taint-manager related code from `controller/nodelifecycle/node_lifecycle_controller.go`.
+A new `NodeLifecycleManager` is implemented by removing taint-manager related code from `controller/nodelifecycle/node_lifecycle_controller.go`.
 
-A new `NoExecuteTaintManage`r is created a first-class controller managed by` kube-controller-manager`. It’s implemention is based on the current taint-manager  `controller/nodelifecycle/taint-manager.go`.  A new flag is added 
-
-`// NoExecuteTaintManagerConfiguration contains elements describing NoExecuteTaintManagerConfiguration`
-`type NoExecuteTaintManagerConfiguration struct {`
-`// enables the default NoExecuteTaintManager. MUST be synced with the`
-`// corresponding flag of the kube-apiserver.`
-`EnableNoExecuteTaintManager bool`
-`  ...`
-`}`
+A new `NoExecuteTaintManager` is created a first-class controller managed by` kube-controller-manager`. It’s implementation is based on the current taint-manager  `controller/nodelifecycle/taint-manager.go`.   
 
 The creation and startup of the default taint-manager is performed by `kube-controller-manager` . 
 
-`func startNoExecuteTaintManager(ctx context.Context, controllerContext ControllerContext) (controller.Interface, bool, error) {`
-`    if !controllerContext.ComponentConfig.NoExecuteTaintManager.EnableNoExecuteTaintManager {
-        return nil, false, nil
-    }`
-
 ```
+func startNoExecuteTaintManager(ctx context.Context, controllerContext ControllerContext) (controller.Interface, bool, error) {`
+    if !controllerContext.ComponentConfig.NoExecuteTaintManager.EnableNoExecuteTaintManager {
+        return nil, false, nil
+    }
+
 taintManager, err = taintmanager.NewNoExecuteTaintManager(ctx, kubeClient, nc.podLister, nc.nodeLister, nc.getPodsAssignedToNode)
         nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
             AddFunc: controllerutil.CreateAddNodeHandler(func(node *v1.Node) error {
@@ -190,19 +161,23 @@ taintManager, err = taintmanager.NewNoExecuteTaintManager(ctx, kubeClient, nc.po
 
 ### Test Plan
 
-* Unit and integration tests
-    * Add nodes taints
+* Unit tests
+    * Enable `TaintManager`
+    * Disable `TaintManager`
+    * Add `NoExecute` taints
     * Act on `NoExecute` to delete running pods
-    * Respect taint tolerations 
-* Verify passing the existing E2E and conformance tests.
-    * Taint a node 
-    * Evict the correct set of running pods
+    * Respect taint toleration 
+* Integration tests
+    * Enable `TaintManager`, add `NoExecute` taints to evict the correct set of running pods on nodes 
+    * Disable `TaintManager`, add `NoExecute` has no impact on running pods
+* E2E tests 
+    * Verify passing the existing E2E and conformance tests.
 
 ### Graduation Criteria
 
 #### Alpha
 
-* Support `kube-controller-manaager` flag `controllers=-taint-manager` to disable the default taint-manager.
+* Support `kube-controller-manager` flag `controllers=-taint-manager` to disable the default taint-manager.
 * Unit and integration tests completed and passed.
 
 #### Beta
@@ -216,7 +191,7 @@ taintManager, err = taintmanager.NewNoExecuteTaintManager(ctx, kubeClient, nc.po
 
 ### Upgrade / Downgrade Strategy
 
-We’ll need to upgrade `kube-controller-manager` and` node-lifecycle-controller` and add a new controller `taint-manager`. Accordingly, a downgrade will revert to the previous version of `kube-controller-manager` and `node-lifeycle-controller` and remove the new added `taint-manager` . There should be no impact on the other components during upgrades and downgrades since user-exposed behavior should stay the same except a new flag to enable/disable the default `taint-manager`. This change should be clearly communicated to users.
+We’ll need to upgrade `kube-controller-manager` and` node-lifecycle-controller` and add a new controller `taint-manager`. Accordingly, a downgrade will revert to the previous version of `kube-controller-manager` and `node-lifecycle-controller` and remove the new added `taint-manager` . There should be no impact on the other components during upgrades and downgrades since user-exposed behavior should stay the same except a new flag to enable/disable the default `taint-manager`. This change should be clearly communicated to users.
 
 ### Version Skew Strategy
 
@@ -228,13 +203,13 @@ We’ll need to upgrade `kube-controller-manager` and` node-lifecycle-controller
 
 * **How can this feature be enabled / disabled in a live cluster?**
     * Enabled:  upgrade `kube-controller-manager` and` node-lifecycle-controller` and add a new `taint-manager` controller.
-    * Disabled: downgrade will revert to the previous version of `kube-controller-manager` and `node-lifeycle-controller` and remove the new added `taint-manager` . 
+    * Disabled: downgrade will revert to the previous version of `kube-controller-manager` and `node-lifecycle-controller` and remove the new added `taint-manager` . 
 * **Does enabling the feature change any default behavior?**
     * No, the default node-life-cycle controller and taint-manager behavior will stay the same.
 * **Can the feature be disabled once it has been enabled (i.e. can we roll back the enablement)?**
     * Yes, we will need to rack back `kube-controller-manager` and `node-lifecycle-controller`. 
-* **What happens if we reenable the feature if it was previously rolled back?**
-    * Upgrade `kube-controller-manager` and `node-lifycle-controller` and add the new `taint-manager`.
+* **What happens if we re-enable the feature if it was previously rolled back?**
+    * Upgrade `kube-controller-manager` and `node-lifecycle-controller` and add the new `taint-manager`.
 * **Are there any tests for feature enablement/disablement?**
     * Planned for Alpha release
 
@@ -300,11 +275,26 @@ We’ll need to upgrade `kube-controller-manager` and` node-lifecycle-controller
 
 ## Alternatives
 
-While operators can opt-out from taint-based eviction by injecting tolerations for `NoExecute` taints, this would have few major disadvantages over custom implementations of `TaintManager`.
+* **Leverage the existing toleration for `NoExecute` taints**: operators opt-out from taint-based eviction by injecting toleration for NoExecute taints. It has a few major disadvantages over an independent `TaintManager`.
+    * It will require to either inject toleration to all pods via mutating webhooks and/or changing the manifests of all the running workloads. 
+    * It will require either injecting toleration to every single pod via mutating webhooks and/or changing the manifests of all the running workloads.
+    * It will still need an additional controller to really evict after coordinating with the external reservation/lease system. This will add additional overhead to toleration injections.
+    * Custom mutating webhook may interfere with the admission plugin that applies the default toleration if they are trying to apply toleration for similar taints.
+    * Toleration update in Webhooks can also cause conflicts with older version of pods especially during upgrades and we need to ensure a toleration update is valid.
 
-* It won’t allow users to leverage the existing tolerations API to interface with the component in charge of handling their termination.
-* It will require to either inject tolerations to all pods via mutating webhooks and/or changing the manifests of all the running workloads.
+* **Enhance the existing toleration APIs**
+    * Introduce a new Toleration effect `EvictIfAllowed` similar to `PreferNoSchedule` with additional fields on each Toleration to specify a reference to another CR/API object for how to reach the external system that governs if eviction is allowed similar to webhooks. Similar to the communication between API Server and admission webooks, `NoExecTaintManager` and an external service can establish whether eviction for a given pod is allowed or not.
+    * Add RBAC for tolerations API on who can add what tolerations. Otherwise, a user can add tolerations to their workloads(pods) and make every pod land on the node to cause a noisy neighbor and even DoS problem in the worst case.
+
+While Kubernetes should be having opinionated defaults, it is important to enable extensions and customizations for pod evictions for `NoExecute`. We need a flexible extension mechanism in eviction through which we can make a call to external systems and interact with  controllers and workload management systems. The extension will also enable to handle workloads that are split across Kubernetes and Non-Kubernetes platforms. 
+
+The use and enhancement of tolerations by injecting tolerations for `NoExecute` is a not viable at scale because of the factors as described earlier.
+
+While there is definitely room for extending the Kubernetes API to support a more graceful form of `NoExecute` respecting the `PodDisruptionBudget` API, the goal of this proposal is to ensure operators can extend Kubernetes by providing custom logic handling taint based eviction to change the default behavior vs having to patch Kubernetes Controller Manager.
 
 ## Infrastructure Needed (Optional)
 
 N/A
+
+## Note
+`taint-manager`, `TaintManager` and `NoExecuteTaintManager` are used interchangeably in this doc.
