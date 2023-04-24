@@ -3,7 +3,6 @@
 - [Release Signoff Checklist](#release-signoff-checklist)
 - [Summary](#summary)
 - [Motivation](#motivation)
-  - [Why the use of  tolerations for <code>NoExecute</code> taints is not good enough for custom pod eviction?](#why-the-use-of--tolerations-for--taints-is-not-good-enough-for-custom-pod-eviction)
   - [Goals](#goals)
   - [Non-Goals](#non-goals)
 - [Proposal](#proposal)
@@ -74,18 +73,6 @@ In this KEP, we propose to
 * The requirement of custom taint-based eviction is not unique. It exists already in Kubernetes, where we call it `FullyDistributionMode`. When all nodes are unhealthy, `NodeLifeCycleController` chooses not to apply `NoExecute` taints properly. In a real-world case, the integrator may choose to define the disruption rate/budget, etc.
 * `NodeCycleController` combines two independent functions: adding a pre-defined set of `NoExecute` taints to unhealthy nodes and performing pod eviction on arbitrary `NoExecute` taints. While  `NodeLifecycle` controller responsibility is primarily on Node unhealthy-zone, `TaintManger` is concerned with actioning the taints added by `NodeLifecycle` controller by performing Pods eviction. De-coupling `NoExecuteTaintManager` from `NodeLifecycle` controller in `kube-controller-manager` would allow to implement a single eviction controller to take care of general Pod eviction and deletion for different cases based on workload needs, including `NoExecute` taint-based pod eviction other than node `Unhealthy` and `Unreachable`.   
 
-### Why the use of  tolerations for `NoExecute` taints is not good enough for custom pod eviction? 
-
-Toleration cannot provide a flexible and general enough extension mechanism to handle different Pod eviction and deletion cases to meet various workload requirements. 
-
-* The toleration mechanism is not flexible enough to handle complex stateful applications and workloads that require specific coordination of pod eviction, e.g. checkpointing for certain classes of machine-learning workloads to guarantee data integrity before deletion.
-* We operate clusters where we want to disable `NoExecute` eviction wholesale. Leveraging toleration would require adding it to every single pod in a cluster. Specifically, custom tolerations will require to either inject tolerations to all pods via mutating webhooks and/or changing the manifests of all the running workloads. 
-    * Custom mutating webhook may interfere with the the[admission plugin](https://github.com/kubernetes/kubernetes/blob/master/plugin/pkg/admission/defaulttolerationseconds/admission.go) that applies the default tolerations if they are trying to apply tolerations for similar taints. 
-    * Toleration update in Webhooks can cause conflicts with older version of pods especially during upgrades. 
-    * In order to ensure toleration updates are valid, a RBAC mechanism will be required in place. 
-* Toleration won’t allow users to leverage the existing tolerations API to interface with the component in charge of handling their termination.
-* It’s hard for toleration to interact with other controllers and workload management systems, which have more knowledge and context about workload disruption. It also limits to kubernetes clusters and cannot handle workloads that are split across Kubernetes/Non-Kubernetes platforms.
-
 ### Goals
 
 * Move taint-based eviction implementation out of `NodeLifeCycleController` into a separate and independent taint-manager.
@@ -93,7 +80,7 @@ Toleration cannot provide a flexible and general enough extension mechanism to h
 
 ### Non-Goals
 
-* Any change to the behaviour of the current taint-manager
+* Any change to the behavior of the current taint-manager
 
 ## Proposal
 
@@ -105,7 +92,7 @@ An operator of stateful workloads that use local persistent volume can disable t
 
 #### Story 2
 
-A cluster orchestrator can design and implement a centralized pod eviction manager that handles all pod eviction and deletions on different `NoExecute`  taints (`Unreachable`, `NotReady` and others) and any custom taints, e.g., acting on the condictions defined in `descheduler`, such as node overloading, etc.
+A cluster orchestrator can design and implement a centralized pod eviction manager that handles all pod eviction and deletions on different `NoExecute`  taints (`Unreachable`, `NotReady` and others) and any custom taints, e.g., acting on the conditions defined in `descheduler`, such as node overloading, etc.
 
 **Story 3**
 
@@ -148,7 +135,7 @@ Opting out from the default `TaintManger`, Kubernetes operators will be able to 
 
 A new `NodeLifeCycleManager` is implemented by removing taint-manager related code from `controller/nodelifecycle/node_lifecycle_controller.go`.
 
-A new `NoExecuteTaintManage`r is created a first-class controller managed by` kube-controller-manager`. It’s implemention is based on the current taint-manager  `controller/nodelifecycle/taint-manager.go`.  A new flag is added 
+A new `NoExecuteTaintManager` is created a first-class controller managed by` kube-controller-manager`. It’s implementation is based on the current taint-manager  `controller/nodelifecycle/taint-manager.go`.  A new flag is added 
 
 `// NoExecuteTaintManagerConfiguration contains elements describing NoExecuteTaintManagerConfiguration`
 `type NoExecuteTaintManagerConfiguration struct {`
@@ -233,8 +220,8 @@ We’ll need to upgrade `kube-controller-manager` and` node-lifecycle-controller
     * No, the default node-life-cycle controller and taint-manager behavior will stay the same.
 * **Can the feature be disabled once it has been enabled (i.e. can we roll back the enablement)?**
     * Yes, we will need to rack back `kube-controller-manager` and `node-lifecycle-controller`. 
-* **What happens if we reenable the feature if it was previously rolled back?**
-    * Upgrade `kube-controller-manager` and `node-lifycle-controller` and add the new `taint-manager`.
+* **What happens if we re-enable the feature if it was previously rolled back?**
+    * Upgrade `kube-controller-manager` and `node-lifeycle-controller` and add the new `taint-manager`.
 * **Are there any tests for feature enablement/disablement?**
     * Planned for Alpha release
 
@@ -300,10 +287,18 @@ We’ll need to upgrade `kube-controller-manager` and` node-lifecycle-controller
 
 ## Alternatives
 
-While operators can opt-out from taint-based eviction by injecting tolerations for `NoExecute` taints, this would have few major disadvantages over custom implementations of `TaintManager`.
+Overall, we need a flexible extension mechanism in eviction through which we can make a call to external systems and interact with other controllers and workload management systems, which have more knowledge about workload disruption. The extension will enable to handle workloads that are split across Kubernetes and Non-Kubernetes platforms.
 
-* It won’t allow users to leverage the existing tolerations API to interface with the component in charge of handling their termination.
-* It will require to either inject tolerations to all pods via mutating webhooks and/or changing the manifests of all the running workloads.
+* **Leverage the existing tolerations for `NoExecute` taints**: operators opt-out from taint-based eviction by injecting tolerations for NoExecute taints. It has a few major disadvantages over an independent `TaintManager`.
+    * It will require to either inject tolerations to all pods via mutating webhooks and/or changing the manifests of all the running workloads. 
+    * It will require either injecting tolerations to every single pod via mutating webhooks and/or changing the manifests of all the running workloads.
+    * It will still need an additional controller to really evict after coordinating with the external reservation/lease system. This will add additional overhead to toleration injections.
+    * Custom mutating webhook may interfere with the admission plugin that applies the default tolerations if they are trying to apply tolerations for similar taints.
+    * Toleration update in Webhooks can also cause conflicts with older version of pods especially during upgrades and we need to ensure a toleration update is valid.
+
+* **Enhance the existing toleration APIs**
+    * We can introduce a new Toleration effect `EvictIfAllowed` similar to `PreferNoSchedule` with additional fields on each Toleration to specify a reference to another CR/API object for how to reach the external system that governs if eviction is allowed similar to webhooks. Similar to the communication between API Server and admission webooks, `NoExecTaintManager` and an external service can establish whether eviction for a given pod is allowed or not.
+    * Adding RBAC for tolerations API on who can add what tolerations is important. Otherwise, a user can add tolerations to their workloads(pods) and make every pod land on the node to cause a noisy neighbor problem and DOS problem in the worst case.
 
 ## Infrastructure Needed (Optional)
 
